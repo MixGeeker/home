@@ -78,6 +78,14 @@ tr.click:hover td { color: var(--accent); }
   padding: 3px 7px; border-radius: 5px; font: 500 12px var(--font-ui); white-space: nowrap; pointer-events: none;
 }
 .lbl span { font: 400 10.5px var(--font-num); color: var(--muted); }
+.dim { font: 500 10.5px var(--font-num); color: var(--accent); background: var(--chip); padding: 0 4px; border-radius: 3px; pointer-events: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip {
+  position: absolute; z-index: 100000; pointer-events: none; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--accent); border-radius: 6px; padding: 6px 9px; font-size: 12px; line-height: 1.5;
+  box-shadow: 0 4px 14px rgba(0,0,0,.15); white-space: nowrap;
+}
+.tip b { display: block; font-weight: 700; }
+.tip span { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
 #err { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
 @media (max-width: 760px) {
   #app { grid-template-columns: 1fr; grid-template-rows: minmax(300px, 58%) 1fr; }
@@ -109,13 +117,14 @@ tr.click:hover td { color: var(--accent); }
     <div class="toggles">
       <label class="tg"><input type="checkbox" id="t-front"> 隐藏临街立面（看进室内）</label>
       <label class="tg"><input type="checkbox" id="t-label" checked> 显示房间名称和面积</label>
+      <label class="tg"><input type="checkbox" id="t-dims" checked> 显示房间尺寸标注（mm）</label>
       <label class="tg"><input type="checkbox" id="t-furn" checked> 显示示意家具</label>
     </div>
     <section id="info" aria-live="polite"></section>
     <p class="note">按《住宅方案 6a》的平面图和立面图搭建，单位为米。墙体、楼梯、电梯和房间按图纸尺寸定位；门窗宽度和窗台高度按立面图比例估算；家具只是示意，用来感受空间大小。面积为墙内净面积估算。</p>
   </aside>
   <div id="view">
-    <div class="hint">拖动旋转 · 滚轮或双指缩放 · 右键平移</div>
+    <div class="hint">点按或悬停墙体、家具看尺寸 · 拖动旋转 · 滚轮缩放</div>
   </div>
 </div>
 
@@ -613,6 +622,68 @@ function roof() {
 
 floor1(); floor2(); floorStd(3); floor4Suite(); floorStd(5); floor6(); roof();
 
+/* ---------- 尺寸标注 ---------- */
+const DIMMAT = new THREE.LineBasicMaterial({ color: '#b9552f', depthTest: false, transparent: true });
+const DIMS = {}, DIML = {};
+const mm = v => String(Math.round(v * 1000));
+function dimLine(n, ax, a, b, c, y) {
+  // ax='x'：沿面宽方向，从 a 到 b，位于 z=c；ax='z'：沿进深方向，位于 x=c
+  const P = (u, off = 0) => ax === 'x' ? new THREE.Vector3(u, y, c + off) : new THREE.Vector3(c + off, y, u);
+  const t = 0.12, pts = [P(a), P(b), P(a, -t), P(a, t), P(b, -t), P(b, t)];
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  geo.setIndex([0, 1, 2, 3, 4, 5]);
+  const l = new THREE.LineSegments(geo, DIMMAT); l.renderOrder = 998; DIMS[n].add(l);
+  const d = document.createElement('div'); d.className = 'dim'; d.textContent = mm(b - a);
+  const o = new CSS2DObject(d); o.position.copy(P((a + b) / 2)); DIMS[n].add(o); DIML[n].push(o);
+}
+for (let n = 1; n <= 6; n++) {
+  DIMS[n] = new THREE.Group(); DIML[n] = []; G[n].add(DIMS[n]);
+  const y = LV[n].b + 0.06;
+  for (const [name, , rects] of ROOMS[n]) {
+    if (!rects || name === '门廊' || name === '电梯') continue;
+    const [x0, x1, z0, z1] = rects.reduce((m, r) => area([r]) > area([m]) ? r : m);
+    if (x1 - x0 > 0.9) dimLine(n, 'x', x0, x1, z0 + 0.3, y);
+    if (z1 - z0 > 0.9) dimLine(n, 'z', z0, z1, x0 + 0.3, y);
+  }
+  dimLine(n, 'x', 0, 9, 10.7, y); dimLine(n, 'z', 0, 10, -0.7, y);
+}
+
+/* ---------- 点按 / 悬停查看构件尺寸 ---------- */
+const KIND = new Map([[M.ext, '外墙'], [M.int, '内墙'], [M.col, '柱'], [M.glass, '玻璃 / 窗'], [M.frame, '窗框 / 栏杆'], [M.stair, '楼梯踏步'],
+  [M.door, '门'], [M.metal, '卷帘门 / 金属'], [M.trim, '线脚'], [M.base, '外墙（首层）'], [M.slab, '楼板'],
+  [M.wood, '木地板'], [M.tile, '地砖'], [M.bath, '卫浴地砖'], [M.stone, '石材地面'], [M.deck, '露台地板']]);
+const tip = document.createElement('div'); tip.className = 'tip'; tip.hidden = true; view.appendChild(tip);
+const hl = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: '#b9552f', depthTest: false }));
+hl.renderOrder = 999; hl.visible = false; scene.add(hl);
+const ray = new THREE.Raycaster(), ptr = new THREE.Vector2(), wp = new THREE.Vector3();
+const shown = o => { for (; o; o = o.parent) if (!o.visible) return false; return true; };
+const inFurn = o => { for (; o; o = o.parent) if (Object.values(FURN).includes(o)) return true; return false; };
+function pick(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ptr.set((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1);
+  ray.setFromCamera(ptr, camera);
+  const hit = ray.intersectObjects(B.children, true).find(h => h.object.isMesh && h.object.geometry.type === 'BoxGeometry' && shown(h.object));
+  if (!hit) { tip.hidden = true; hl.visible = false; return; }
+  const m = hit.object, { width: w, height: h, depth: d } = m.geometry.parameters;
+  const FK = new Map([[M.fabric, '沙发 / 椅子'], [M.linen, '床垫'], [M.fwood, '柜子 / 桌 / 床架'], [M.white, '洁具 / 厨柜'], [M.dark, '电视 / 显示器 / 柜体'], [M.plant, '绿植'], [M.rug, '地毯'], [M.car, '汽车'], [M.metal, '冰箱 / 金属']]);
+  const furn = inFurn(m), kind = furn ? (FK.get(m.material) || '家具') : (KIND.get(m.material) || '构件');
+  const isWall = /墙/.test(kind);
+  const size = isWall ? `长 ${mm(Math.max(w, d))} × 厚 ${mm(Math.min(w, d))} × 高 ${mm(h)}`
+    : `面宽 ${mm(w)} × 进深 ${mm(d)} × 高 ${mm(h)}`;
+  const lo = m.getWorldPosition(wp).y - h / 2, floorN = [6, 5, 4, 3, 2, 1].find(n => lo >= LV[n].b - 0.2) || 1;
+  const off = lo - LV[floorN].b;
+  tip.innerHTML = `<b>${kind}</b><span>${size} mm</span>${off > 0.05 ? `<br><span>离地 ${mm(off)} mm</span>` : ''}`;
+  tip.hidden = false;
+  const tx = Math.min(e.clientX - r.left + 14, r.width - tip.offsetWidth - 8), ty = Math.max(8, e.clientY - r.top - tip.offsetHeight - 10);
+  tip.style.left = tx + 'px'; tip.style.top = ty + 'px';
+  hl.scale.set(w + 0.01, h + 0.01, d + 0.01); hl.position.copy(m.getWorldPosition(wp)); hl.visible = true;
+}
+let down = null;
+renderer.domElement.addEventListener('pointermove', e => { if (e.pointerType === 'mouse' && !e.buttons) pick(e); });
+renderer.domElement.addEventListener('pointerdown', e => { down = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', e => { if (down && Math.hypot(e.clientX - down[0], e.clientY - down[1]) < 6) pick(e); down = null; });
+renderer.domElement.addEventListener('pointerleave', () => { tip.hidden = true; hl.visible = false; });
+
 /* ---------- 地面、道路 ---------- */
 const groundMat = new THREE.MeshStandardMaterial({ roughness: 1 });
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), groundMat);
@@ -629,13 +700,14 @@ function applyTheme() {
   scene.background = new THREE.Color(cs.getPropertyValue('--scene').trim() || '#dfe7ec');
   groundMat.color.set(cs.getPropertyValue('--ground').trim() || '#c8ccc4');
   roadMat.color.set(cs.getPropertyValue('--road').trim() || '#9a9e9f');
+  const ac = cs.getPropertyValue('--accent').trim() || '#b9552f'; DIMMAT.color.set(ac); hl.material.color.set(ac);
 }
 applyTheme();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
 /* ---------- 交互 ---------- */
-const state = { sel: 'all', front: false, labels: true, furn: true };
+const state = { sel: 'all', front: false, labels: true, furn: true, dims: true };
 const goal = { t: new THREE.Vector3(0, 9, 0), p: new THREE.Vector3(21, 16, 31), on: false };
 controls.addEventListener('start', () => { goal.on = false; });
 
@@ -645,6 +717,8 @@ function apply() {
   G[7].visible = s === 'all';
   for (let n = 1; n <= 7; n++) { FURN[n].visible = state.furn; for (const o of LBL[n]) o.visible = state.labels && s !== 'all' && n === s; }
   for (const m of FRONT) m.visible = !state.front;
+  for (let n = 1; n <= 6; n++) { const on = state.dims && s !== 'all' && n === s; DIMS[n].visible = on; for (const o of DIML[n]) o.visible = on; }
+  tip.hidden = true; hl.visible = false;
   document.querySelectorAll('#floors button').forEach(btn => btn.setAttribute('aria-pressed', String(btn.dataset.f === String(s))));
   renderInfo();
 }
@@ -674,6 +748,7 @@ function renderInfo() {
 document.querySelectorAll('#floors button').forEach(btn => btn.addEventListener('click', () => select(btn.dataset.f === 'all' ? 'all' : +btn.dataset.f)));
 document.getElementById('t-front').addEventListener('change', e => { state.front = e.target.checked; apply(); });
 document.getElementById('t-label').addEventListener('change', e => { state.labels = e.target.checked; apply(); });
+document.getElementById('t-dims').addEventListener('change', e => { state.dims = e.target.checked; apply(); });
 document.getElementById('t-furn').addEventListener('change', e => { state.furn = e.target.checked; apply(); });
 apply();
 
